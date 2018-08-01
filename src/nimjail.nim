@@ -1,4 +1,4 @@
-import os, osproc, posix, linux,  strformat, strutils, strformat, parseopt2, ospaths
+import os, osproc, posix, linux,  strformat, strutils, strformat, parseopt2, ospaths, strtabs
 
 import random
 
@@ -13,6 +13,7 @@ type ChildConfig = object
   fd* : int
   hostname*: string
   argv*: seq[string]
+  env*: StringTableRef
   cmd* : string
   mountDir*: string
 
@@ -46,7 +47,9 @@ proc setresuid*(ruid, euid, suid: cint): cint {.importc, header: "<unistd.h>".}
 proc setresgid*(rgid, egid, sgid: cint): cint {.importc, header: "<unistd.h>".}
 proc chroot*(path: cstring): cint {.importc, header: "<unistd.h>".}
 proc perror*(msg: cstring)  {.importc, header: "<unistd.h>".}
-  
+proc gethostname(name: cstring, namelen: cint):int {.importc, header:"<unistd.h>".}
+proc sethostname(name: cstring, namelen: cint):int {.importc, header:"<unistd.h>".}
+
 
 proc pivot_root*(new_root, old_root: string) =
   # 217 -> SYS_pivot_root
@@ -104,7 +107,7 @@ proc userns(cfg: ptr ChildConfig) =
   discard posix.write(cint(cfg.fd), addr has_userns, sizeof(has_userns)) 
 
   var result = 0;
-  discard read(cint(cfg.fd), addr result, sizeof(result))
+  discard posix.read(cint(cfg.fd), addr result, sizeof(result))
 
   echo fmt("=> switching to uid {cfg.uid} / {cfg.uid} ...")
 
@@ -114,29 +117,36 @@ proc userns(cfg: ptr ChildConfig) =
   discard setresgid(cint(cfg.uid), cint(cfg.uid), cint(cfg.uid))
   
 proc childAction(cfg: ptr ChildConfig):cint  =  
+  discard sethostname(cstring(cfg.hostname), cint(len(cfg.hostname)))
   mounts(cfg)
   userns(cfg)
 
   let exe = findExe(cfg.cmd)
-  echo fmt("execve {exe}  ...")
+  echo fmt("execve {exe}  ... argv: {$cfg.argv}")
   var args = allocCStringArray(@[exe] & cfg.argv)
-  var env = allocCStringArray(@[])
+  var env = allocCStringArray(@["""PS1=\u@\h $"""])
+  execve(exe, args, env) 
 
-  discard execve(exe, args, env) 
+  # let p =  startProcess(command="/usr/bin/busybox", args= @["ash"], options={poParentStreams})
+  # discard p.waitForExit()
+
+  # let p =  startProcess(exe, "", cfg.argv, nil, {poParentStreams})
+  # let res = p.waitForExit()
+  # return cint(res)
 
 proc prepare_child_uidmap(child_pid: Pid, fd: int) =
   let USERNS_OFFSET = 10000
   let USERNS_COUNT = 2000
   var has_userns = -1
   
-  discard read(cint(fd), addr has_userns, sizeof(has_userns))
+  discard posix.read(cint(fd), addr has_userns, sizeof(has_userns))
   let files = @[fmt("/proc/{child_pid}/uid_map"), fmt("/proc/{child_pid}/gid_map")]
 
   for f in files:
     writeFile(f, fmt("0 {USERNS_OFFSET} {USERNS_COUNT}\n"))
   
   var data = cint(0)
-  discard write(cint(fd), addr data, sizeof(data))
+  discard posix.write(cint(fd), addr data, sizeof(data))
 
 proc writeHelp() = 
   echo """
@@ -185,7 +195,9 @@ proc cli*() =
     else:
       discard
 
-  var cfg =  ChildConfig(argc:len(args), hostname:hostname, uid:uid, mountDir:mountdir, cmd:cmd, argv:args)
+  var cfg =  ChildConfig(argc:len(args), hostname:hostname, uid:uid, mountDir:mountdir, cmd:cmd, argv:args, env:newStringTable({"LOVE":"OK"}))
+  cfg.env["PS1"] = fmt(""" \h @ \w <nimjail> $ """)
+  cfg.env["USER"] = "root"
   var sockets : array[2, cint]
   let stackEnd = cast[clong](alloc(stackSize))
   let stack = cast[pointer](stackEnd + stackSize)
@@ -195,11 +207,13 @@ proc cli*() =
 
   let fn : pointer = childAction
   var pid = clone(fn, stack, cint(newnsFlags), pointer(addr cfg), nil, nil, nil)
+
   if pid > 0:
     # handle child uidmap 
     prepare_child_uidmap(pid, sockets[0])
     var exitcode: cint
-    discard waitpid(pid, exitcode, WNOHANG )
+
+    discard waitpid(pid, exitcode, 0)
     echo "PARENT AFTER CHILD DONE: " & execCmdEx("hostname")[0]
 
 
